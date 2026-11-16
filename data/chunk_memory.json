@@ -1,0 +1,73 @@
+{
+  "chunk_001": {
+    "schema_version": "1.0",
+    "level": 1.0,
+    "weight": 1.0,
+    "success_rate": 1.0,
+    "first_seen": "2026-03-08",
+    "last_seen": "2026-03-15",
+    "usage_count": 42,
+    "source_lesson": "lesson_001",
+    "variation_forms": [
+      "dobrý den"
+    ]
+  },
+  "chunk_004": {
+    "schema_version": "1.0",
+    "level": 1.0,
+    "weight": 1.0,
+    "success_rate": 1.0,
+    "first_seen": "2026-03-08",
+    "last_seen": "2026-03-14",
+    "usage_count": 49,
+    "source_lesson": "lesson_001",
+    "variation_forms": [
+      "dám si čaj",
+      "dám si vodu"
+    ]
+  },
+  "chunk_002": {
+    "schema_version": "1.0",
+    "level": 1.0,
+    "weight": 1.0,
+    "success_rate": 1.0,
+    "first_seen": "2026-03-09",
+    "last_seen": "2026-03-15",
+    "usage_count": 12,
+    "source_lesson": null,
+    "variation_forms": []
+  },
+  "chunk_003": {
+    "schema_version": "1.0",
+    "level": 1.0,
+    "weight": 1.0,
+    "success_rate": 1.0,
+    "first_seen": "2026-03-09",
+    "last_seen": "2026-03-15",
+    "usage_count": 11,
+    "source_lesson": null,
+    "variation_forms": []
+  },
+  "chunk_005": {
+    "schema_version": "1.0",
+    "level": 0.3,
+    "weight": 0.3,
+    "success_rate": 1.0,
+    "first_seen": "2026-03-09",
+    "last_seen": "2026-03-14",
+    "usage_count": 3,
+    "source_lesson": null,
+    "variation_forms": []
+  },
+  "chunk_010": {
+    "schema_version": "1.0",
+    "level": 0.1,
+    "weight": 0.1,
+    "success_rate": 1.0,
+    "first_seen": "2026-03-09",
+    "last_seen": "2026-03-09",
+    "usage_count": 1,
+    "source_lesson": null,
+    "variation_forms": []
+  }
+}
