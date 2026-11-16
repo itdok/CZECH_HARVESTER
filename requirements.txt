@@ -1,0 +1,11 @@
+google-auth
+google-auth-oauthlib
+google-auth-httplib2
+google-api-python-client
+google-genai
+google-generativeai
+python-dotenv
+aiogram
+faster-whisper
+genanki
+pytest
