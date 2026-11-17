@@ -42,6 +42,9 @@ htmlcov/
 *.swp
 *.swo
 
-# Data dumps / Anki packages
+# Data dumps / Anki packages / Runtime sessions & logs
 data/*.apkg
 *.apkg
+data/sessions/
+data/agent.log*
+data/tmp/

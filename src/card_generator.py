@@ -116,8 +116,12 @@ def _generate_cards_gemini(
     if not key and client is None:
         raise CardGenerationError("GEMINI_API_KEY is not set in environment or arguments.")
 
-    model = model_name or os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
-    ai_client = client if client is not None else genai.Client(api_key=key)
+    model = model_name or os.getenv("GEMINI_MODEL", "gemini-3-flash-preview")
+    ai_client = (
+        client
+        if client is not None
+        else genai.Client(api_key=key, http_options={"api_version": "v1beta"})
+    )
 
     prompt = _build_prompt(phrases)
     config = types.GenerateContentConfig(

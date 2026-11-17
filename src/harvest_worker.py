@@ -91,9 +91,31 @@ def get_stub_document_ast(doc_id: str) -> Dict[str, Any]:
     }
 
 
+def _resolve_google_access_token(access_token: Optional[str] = None) -> Optional[str]:
+    """Resolves Google OAuth access token from argument, env var, or local token.json."""
+    token = access_token or os.getenv("GOOGLE_ACCESS_TOKEN")
+    if token:
+        return token
+    token_path = BASE_DIR / "token.json"
+    if token_path.exists():
+        try:
+            from google.auth.transport.requests import Request
+            from google.oauth2.credentials import Credentials
+
+            creds = Credentials.from_authorized_user_file(str(token_path))
+            if creds and creds.expired and creds.refresh_token:
+                creds.refresh(Request())
+                token_path.write_text(creds.to_json(), encoding="utf-8")
+            if creds and creds.valid and creds.token:
+                return creds.token
+        except Exception:
+            pass
+    return None
+
+
 def fetch_document_ast(doc_id: str, access_token: Optional[str] = None) -> Dict[str, Any]:
     """
-    Fetches Google Docs AST via Google Docs API if token is provided,
+    Fetches Google Docs AST via Google Docs API v1 if token is provided,
     otherwise returns a stub AST.
     """
     token = access_token or os.getenv("GOOGLE_ACCESS_TOKEN")
@@ -104,6 +126,31 @@ def fetch_document_ast(doc_id: str, access_token: Optional[str] = None) -> Dict[
         return resp.json()
 
     return get_stub_document_ast(doc_id)
+
+
+def clear_document_highlights(
+    doc_id: str,
+    clear_requests: List[Dict[str, Any]],
+    access_token: Optional[str] = None,
+) -> bool:
+    """
+    Applies UpdateTextStyleRequest batchUpdate to Google Docs API v1 to clear
+    yellow highlights after phrases have been harvested.
+    """
+    if not clear_requests:
+        return False
+    token = access_token or os.getenv("GOOGLE_ACCESS_TOKEN")
+    if not token:
+        return False
+    url = f"https://docs.googleapis.com/v1/documents/{doc_id}:batchUpdate"
+    resp = requests.post(
+        url,
+        headers={"Authorization": f"Bearer {token}"},
+        json={"requests": clear_requests},
+        timeout=10.0,
+    )
+    resp.raise_for_status()
+    return True
 
 
 def _build_genanki_model() -> genanki.Model:
@@ -183,11 +230,15 @@ def export_to_anki(
     # 1. Attempt AnkiConnect direct HTTP sync
     try:
         # Create deck if not exists
-        requests.post(
+        deck_resp = requests.post(
             anki_connect_url,
             json={"action": "createDeck", "version": 6, "params": {"deck": deck_name}},
             timeout=2.0,
         )
+        deck_resp.raise_for_status()
+        deck_data = deck_resp.json()
+        if deck_data.get("error") is not None:
+            raise RuntimeError(f"AnkiConnect createDeck error: {deck_data.get('error')}")
 
         notes_payload = []
         for card in cards:
@@ -210,11 +261,21 @@ def export_to_anki(
         data = resp.json()
 
         if data.get("error") is None:
-            return {
-                "method": "ankiconnect",
-                "count": len(cards),
-                "apkg_path": None,
-            }
+            results = data.get("result")
+            if isinstance(results, list):
+                added_count = sum(1 for item in results if item is not None)
+                if added_count > 0:
+                    return {
+                        "method": "ankiconnect",
+                        "count": added_count,
+                        "apkg_path": None,
+                    }
+            else:
+                return {
+                    "method": "ankiconnect",
+                    "count": len(cards),
+                    "apkg_path": None,
+                }
     except Exception:
         # AnkiConnect failed or desktop unreachable -> fallback to genanki
         pass
@@ -272,6 +333,16 @@ def run_harvest_pipeline(
     # 6. Export to Anki
     export_result = export_to_anki(cards, output_dir=output_dir)
 
+    # 7. Clear yellow highlights in Google Docs if live token is available
+    highlights_cleared = False
+    if custom_doc_ast is None and clear_requests:
+        try:
+            highlights_cleared = clear_document_highlights(
+                doc_id, clear_requests, access_token=access_token
+            )
+        except Exception:
+            highlights_cleared = False
+
     return {
         "status": "success",
         "doc_id": doc_id,
@@ -279,6 +350,7 @@ def run_harvest_pipeline(
         "cards_count": len(cards),
         "export_result": export_result,
         "clear_requests": clear_requests,
+        "highlights_cleared": highlights_cleared,
         "cards": cards,
     }
 
@@ -307,7 +379,8 @@ async def handle_harvest_command(message: Message) -> None:
     status_msg = await message.answer(f"🌾 Начинаю обработку документа `{doc_id}`...", parse_mode="Markdown")
 
     try:
-        pipeline_result = run_harvest_pipeline(doc_id)
+        token = _resolve_google_access_token()
+        pipeline_result = run_harvest_pipeline(doc_id, access_token=token)
 
         if pipeline_result["status"] == "empty":
             await status_msg.edit_text(

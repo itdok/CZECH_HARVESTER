@@ -131,6 +131,31 @@ class TestExportToAnki(unittest.TestCase):
             self.assertEqual(res["count"], 2)
             self.assertTrue(res["apkg_path"].exists())
 
+    def test_ankiconnect_all_null_results_falls_back_to_genanki(self):
+        deck_resp = mock.MagicMock(status_code=200)
+        deck_resp.json.return_value = {"result": 123, "error": None}
+        notes_resp = mock.MagicMock(status_code=200)
+        notes_resp.json.return_value = {"result": [None, None], "error": None}
+
+        with mock.patch("src.harvest_worker.requests.post", side_effect=[deck_resp, notes_resp]):
+            res = export_to_anki(self.sample_cards, output_dir=self.output_dir)
+
+            self.assertEqual(res["method"], "genanki")
+            self.assertEqual(res["count"], 2)
+            self.assertTrue(res["apkg_path"].exists())
+
+    def test_ankiconnect_partial_null_counts_only_added_notes(self):
+        deck_resp = mock.MagicMock(status_code=200)
+        deck_resp.json.return_value = {"result": 123, "error": None}
+        notes_resp = mock.MagicMock(status_code=200)
+        notes_resp.json.return_value = {"result": [101, None], "error": None}
+
+        with mock.patch("src.harvest_worker.requests.post", side_effect=[deck_resp, notes_resp]):
+            res = export_to_anki(self.sample_cards, output_dir=self.output_dir)
+
+            self.assertEqual(res["method"], "ankiconnect")
+            self.assertEqual(res["count"], 1)
+
     def test_export_via_genanki_direct(self):
         apkg_path = export_via_genanki(
             self.sample_cards,
