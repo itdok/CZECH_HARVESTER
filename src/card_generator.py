@@ -18,6 +18,10 @@ class CardItem(BaseModel):
     f: str = Field(description="Czech sentence/context with target phrase bolded in <b>...</b> tags")
     t: str = Field(description="Russian translation of the sentence and target phrase")
     g: str = Field(description="Brief grammar/morphology notes in Russian (case, aspect, form, etc.)")
+    h: str = Field(
+        default="",
+        description="Short Russian translation of ONLY the hidden Czech target phrase (2-5 words, no full sentence, no colons)",
+    )
 
 
 class CardBatch(BaseModel):
@@ -30,35 +34,57 @@ class CardGenerationError(Exception):
 
 
 def strip_cloze_and_html(text: str) -> str:
-    """Removes Anki Cloze syntax ({{c1::...}}) and basic HTML bold tags to get clean text."""
+    """Removes Anki Cloze syntax ({{c1::chunk}} or {{c1::chunk::hint}}) and basic HTML bold tags to get clean text."""
     if not text:
         return ""
-    cleaned = re.sub(r"\{\{c\d+::(.*?)(?:::[^}]*)?\}\}", r"\1", text)
+    cleaned = re.sub(r"\{\{c\d+::((?:(?!::|\}\}).)*)(?:::[^}]*)?\}\}", r"\1", text)
     cleaned = re.sub(r"</?b>", "", cleaned, flags=re.IGNORECASE)
     return " ".join(cleaned.split()).strip()
 
 
-def format_cloze_sentence(f_text: str, target_phrase: str = "") -> str:
+def _sanitize_cloze_hint(hint: str) -> str:
+    """Normalizes a Cloze hint and strips colons so Anki Cloze syntax is never broken."""
+    if not hint:
+        return ""
+    return " ".join(hint.replace(":", "").split()).strip()
+
+
+def format_cloze_sentence(f_text: str, target_phrase: str = "", hint: str = "") -> str:
     """
     Formats a Czech sentence for Anki Cloze:
-    - Leaves existing {{c1::...}} syntax intact.
-    - Converts <b>...</b> tags to {{c1::...}}.
+    - Converts <b>...</b> tags to {{c1::...}} (or {{c1::...::hint}} when hint is provided).
+    - Adds ::hint to existing {{c1::...}} without a hint if hint is provided.
     - Otherwise wraps target_phrase in {{c1::...}} (case-insensitive).
     """
+    clean_hint = _sanitize_cloze_hint(hint)
+    hint_suffix = f"::{clean_hint}" if clean_hint else ""
+
     if not f_text:
-        return f"{{{{c1::{target_phrase}}}}}" if target_phrase else ""
+        return f"{{{{c1::{target_phrase}{hint_suffix}}}}}" if target_phrase else ""
     if re.search(r"\{\{c\d+::", f_text):
+        if clean_hint:
+            # Add hint only to clozes that do not already have a ::hint
+            return re.sub(
+                r"\{\{(c\d+)::((?:(?!::|\}\}).)*)\}\}",
+                lambda m: f"{{{{{m.group(1)}::{m.group(2)}{hint_suffix}}}}}",
+                f_text,
+            )
         return f_text
     if re.search(r"<b>.*?</b>", f_text, flags=re.IGNORECASE):
-        return re.sub(r"<b>(.*?)</b>", r"{{c1::\1}}", f_text, flags=re.IGNORECASE)
+        return re.sub(
+            r"<b>(.*?)</b>",
+            lambda m: f"{{{{c1::{m.group(1)}{hint_suffix}}}}}",
+            f_text,
+            flags=re.IGNORECASE,
+        )
 
     clean_phrase = target_phrase.strip()
     if clean_phrase:
         match = re.search(re.escape(clean_phrase), f_text, flags=re.IGNORECASE)
         if match:
             start, end = match.span()
-            return f"{f_text[:start]}{{{{c1::{f_text[start:end]}}}}}{f_text[end:]}"
-        return f"{f_text} ({{{{c1::{clean_phrase}}}}})"
+            return f"{f_text[:start]}{{{{c1::{f_text[start:end]}{hint_suffix}}}}}{f_text[end:]}"
+        return f"{f_text} ({{{{c1::{clean_phrase}{hint_suffix}}}}})"
 
     return f_text
 
@@ -104,7 +130,9 @@ def _build_prompt(phrases: List[Dict[str, Any]]) -> str:
         "(e.g., 'To je <b>drahá kniha</b>.').\n"
         "- `t`: Natural Russian translation of the sentence and target phrase in this specific context.\n"
         "- `g`: Brief, precise grammatical note in Russian (part of speech, case/pád, aspect/vid dokon./nedokon., "
-        "preposition government, or key usage pattern).\n\n"
+        "preposition government, or key usage pattern).\n"
+        "- `h`: Short Russian translation of ONLY the hidden Czech target phrase (2–5 words, no full sentence "
+        "translation, no colons) to be used as an Anki Cloze hint.\n\n"
         f"Phrases:\n{input_block}"
     )
 
@@ -119,6 +147,7 @@ def _finalize_cards(card_items: List[CardItem], original_phrases: List[Dict[str,
             "f": f_text,
             "t": card.t.strip(),
             "g": card.g.strip(),
+            "h": _sanitize_cloze_hint(card.h),
         })
     return result
 

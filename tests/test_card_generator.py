@@ -316,22 +316,46 @@ class TestFallbackRouting(unittest.TestCase):
 
 
 class TestClozeHelpers(unittest.TestCase):
+    def test_card_item_parses_hint_field(self):
+        item = CardItem(
+            f="To je <b>drahá kniha</b>.",
+            t="Это дорогая книга.",
+            g="drahý - прил.",
+            h="дорогая книга",
+        )
+        self.assertEqual(item.h, "дорогая книга")
+        self.assertIn("`h`", _build_prompt([{"phrase": "drahá kniha", "context": "To je drahá kniha."}]))
+
     def test_format_cloze_sentence_converts_bold(self):
         self.assertEqual(
             format_cloze_sentence("To je <b>drahá kniha</b>."),
             "To je {{c1::drahá kniha}}.",
         )
 
+    def test_format_cloze_sentence_with_hint_and_colon_sanitization(self):
+        self.assertEqual(
+            format_cloze_sentence("To je <b>drahá kniha</b>.", hint="дорогая: книга"),
+            "To je {{c1::drahá kniha::дорогая книга}}.",
+        )
+        self.assertEqual(
+            format_cloze_sentence("To je <b>drahá kniha</b>.", hint="   "),
+            "To je {{c1::drahá kniha}}.",
+        )
+
     def test_format_cloze_sentence_wraps_target_phrase(self):
         self.assertEqual(
-            format_cloze_sentence("Drahá kniha leží na stole.", "drahá kniha"),
-            "{{c1::Drahá kniha}} leží na stole.",
+            format_cloze_sentence("Drahá kniha leží na stole.", "drahá kniha", hint="дорогая книга"),
+            "{{c1::Drahá kniha::дорогая книга}} leží na stole.",
         )
 
     def test_strip_cloze_and_html(self):
         self.assertEqual(
-            strip_cloze_and_html("To je {{c1::drahá kniha::noun}}."),
+            strip_cloze_and_html("To je {{c1::drahá kniha::дорогая книга}}."),
             "To je drahá kniha.",
+        )
+        self.assertEqual(
+            strip_cloze_and_html("Sraz je v {{c1::14:30::полтретьего}}."),
+            "Sraz je v 14:30.",
         )
         self.assertEqual(
             strip_cloze_and_html("To je <b>drahá kniha</b>."),

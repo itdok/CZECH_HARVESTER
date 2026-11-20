@@ -75,11 +75,13 @@ class TestExportToAnki(unittest.TestCase):
                 "f": "To je <b>drahá kniha</b>.",
                 "t": "Это дорогая книга.",
                 "g": "drahý - прил., kniha - сущ.",
+                "h": "дорогая книга",
             },
             {
                 "f": "Mám se <b>dobře</b>.",
                 "t": "У меня все хорошо.",
                 "g": "dobře - наречие",
+                "h": "",
             },
         ]
 
@@ -127,18 +129,21 @@ class TestExportToAnki(unittest.TestCase):
             add_notes_payload = mock_post.call_args_list[-1].kwargs["json"]
             self.assertEqual(add_notes_payload["action"], "addNotes")
             note0 = add_notes_payload["params"]["notes"][0]
+            note1 = add_notes_payload["params"]["notes"][1]
             self.assertEqual(note0["deckName"], "Čeština::Harvester")
             self.assertEqual(note0["modelName"], "Cloze")
-            self.assertEqual(note0["fields"]["Text"], "To je {{c1::drahá kniha}}.")
+            self.assertEqual(note0["fields"]["Text"], "To je {{c1::drahá kniha::дорогая книга}}.")
+            self.assertEqual(note1["fields"]["Text"], "Mám se {{c1::dobře}}.")
             self.assertIn("Это дорогая книга.", note0["fields"]["Back Extra"])
             self.assertIn("[sound:czech_", note0["fields"]["Back Extra"])
             self.assertNotIn("<br>", note0["fields"]["Back Extra"])
 
-            # Verify findNotes used clean sentence without {{c1::}}
+            # Verify findNotes used clean sentence without {{c1::}} and without ::hint
             find_payload = mock_post.call_args_list[2].kwargs["json"]
             self.assertEqual(find_payload["action"], "findNotes")
             self.assertIn("To je drahá kniha.", find_payload["params"]["query"])
             self.assertNotIn("{{c1::", find_payload["params"]["query"])
+            self.assertNotIn("дорогая книга", find_payload["params"]["query"])
 
     def test_ankiconnect_cloze_russian_localized_fields(self):
         responses = [
@@ -158,7 +163,7 @@ class TestExportToAnki(unittest.TestCase):
             note0 = mock_post.call_args_list[-1].kwargs["json"]["params"]["notes"][0]
             self.assertIn("Текст", note0["fields"])
             self.assertIn("Дополнительно", note0["fields"])
-            self.assertEqual(note0["fields"]["Текст"], "To je {{c1::drahá kniha}}.")
+            self.assertEqual(note0["fields"]["Текст"], "To je {{c1::drahá kniha::дорогая книга}}.")
 
     def test_ankiconnect_skips_duplicate_via_find_notes(self):
         responses = [
@@ -382,9 +387,26 @@ class TestTelegramHandler(unittest.TestCase):
 
     def test_handle_harvest_missing_argument(self):
         msg = DummyMessage("/harvest")
-        _run(handle_harvest_command(msg))
+        with mock.patch.dict("os.environ", {"DEFAULT_GOOGLE_DOC_ID": ""}):
+            _run(handle_harvest_command(msg))
         self.assertEqual(len(msg.answers), 1)
         self.assertIn("укажите ID документа", msg.answers[0])
+
+    def test_handle_harvest_uses_default_google_doc_id(self):
+        msg = DummyMessage("/harvest")
+        pipeline_mock_res = {
+            "status": "success",
+            "doc_id": "1_qgPO67c9u4cJxBxE_XO_yctfGhkAOYFgRjMxVzvVu0",
+            "phrases_count": 1,
+            "cards_count": 1,
+            "export_result": {"method": "ankiconnect", "count": 1, "apkg_path": None},
+        }
+        with mock.patch.dict("os.environ", {"DEFAULT_GOOGLE_DOC_ID": "1_qgPO67c9u4cJxBxE_XO_yctfGhkAOYFgRjMxVzvVu0"}), \
+             mock.patch("src.harvest_worker.run_harvest_pipeline", return_value=pipeline_mock_res) as mock_pipeline:
+            _run(handle_harvest_command(msg))
+            mock_pipeline.assert_called_once()
+            self.assertEqual(mock_pipeline.call_args.args[0], "1_qgPO67c9u4cJxBxE_XO_yctfGhkAOYFgRjMxVzvVu0")
+            self.assertIn("Успешно обработано", msg.status_msg.edits[0])
 
     def test_handle_harvest_ankiconnect_success(self):
         msg = DummyMessage("/harvest doc_abc_123")

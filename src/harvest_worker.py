@@ -274,7 +274,7 @@ def export_via_genanki(
     model = genanki.CLOZE_MODEL
 
     for card in cards:
-        cloze_text = format_cloze_sentence(card.get("f", ""))
+        cloze_text = format_cloze_sentence(card.get("f", ""), hint=card.get("h", ""))
         back_extra = _format_back_extra(
             card.get("t", "").strip(),
             card.get("g", "").strip(),
@@ -330,7 +330,7 @@ def export_to_anki(
         notes_payload: List[Dict[str, Any]] = []
         skipped_duplicates = 0
         for card in cards:
-            cloze_sentence = format_cloze_sentence(card.get("f", ""))
+            cloze_sentence = format_cloze_sentence(card.get("f", ""), hint=card.get("h", ""))
             clean_sentence = strip_cloze_and_html(cloze_sentence)
 
             if _is_duplicate_in_anki(clean_sentence, deck_name, anki_connect_url=anki_connect_url):
@@ -483,7 +483,12 @@ async def handle_harvest_command(message: Message) -> None:
     text = (message.text or "").strip()
     parts = text.split(maxsplit=1)
 
-    if len(parts) < 2 or not parts[1].strip():
+    if len(parts) >= 2 and parts[1].strip():
+        raw_arg = parts[1].strip()
+    else:
+        raw_arg = os.getenv("DEFAULT_GOOGLE_DOC_ID", "").strip()
+
+    if not raw_arg:
         await message.answer(
             "⚠️ Пожалуйста, укажите ID документа или ссылку:\n"
             "Пример: `/harvest 1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgvE2upms`",
@@ -491,7 +496,6 @@ async def handle_harvest_command(message: Message) -> None:
         )
         return
 
-    raw_arg = parts[1].strip()
     doc_id = extract_doc_id(raw_arg)
 
     if not doc_id:
