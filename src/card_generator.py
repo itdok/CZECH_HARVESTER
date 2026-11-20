@@ -29,6 +29,40 @@ class CardGenerationError(Exception):
     pass
 
 
+def strip_cloze_and_html(text: str) -> str:
+    """Removes Anki Cloze syntax ({{c1::...}}) and basic HTML bold tags to get clean text."""
+    if not text:
+        return ""
+    cleaned = re.sub(r"\{\{c\d+::(.*?)(?:::[^}]*)?\}\}", r"\1", text)
+    cleaned = re.sub(r"</?b>", "", cleaned, flags=re.IGNORECASE)
+    return " ".join(cleaned.split()).strip()
+
+
+def format_cloze_sentence(f_text: str, target_phrase: str = "") -> str:
+    """
+    Formats a Czech sentence for Anki Cloze:
+    - Leaves existing {{c1::...}} syntax intact.
+    - Converts <b>...</b> tags to {{c1::...}}.
+    - Otherwise wraps target_phrase in {{c1::...}} (case-insensitive).
+    """
+    if not f_text:
+        return f"{{{{c1::{target_phrase}}}}}" if target_phrase else ""
+    if re.search(r"\{\{c\d+::", f_text):
+        return f_text
+    if re.search(r"<b>.*?</b>", f_text, flags=re.IGNORECASE):
+        return re.sub(r"<b>(.*?)</b>", r"{{c1::\1}}", f_text, flags=re.IGNORECASE)
+
+    clean_phrase = target_phrase.strip()
+    if clean_phrase:
+        match = re.search(re.escape(clean_phrase), f_text, flags=re.IGNORECASE)
+        if match:
+            start, end = match.span()
+            return f"{f_text[:start]}{{{{c1::{f_text[start:end]}}}}}{f_text[end:]}"
+        return f"{f_text} ({{{{c1::{clean_phrase}}}}})"
+
+    return f_text
+
+
 def _ensure_bold_phrase(f_text: str, target_phrase: str) -> str:
     """
     Ensures that target_phrase is highlighted with <b>...</b> tags inside f_text.

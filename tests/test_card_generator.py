@@ -13,7 +13,9 @@ from src.card_generator import (
     _build_prompt,
     _ensure_bold_phrase,
     _parse_card_batch_response,
+    format_cloze_sentence,
     generate_cards,
+    strip_cloze_and_html,
 )
 
 
@@ -311,6 +313,30 @@ class TestFallbackRouting(unittest.TestCase):
         self.assertEqual(cards[0]["t"], "Это план Б.")
         mock_client.models.generate_content.assert_called_once()
         mock_post.assert_called_once()
+
+
+class TestClozeHelpers(unittest.TestCase):
+    def test_format_cloze_sentence_converts_bold(self):
+        self.assertEqual(
+            format_cloze_sentence("To je <b>drahá kniha</b>."),
+            "To je {{c1::drahá kniha}}.",
+        )
+
+    def test_format_cloze_sentence_wraps_target_phrase(self):
+        self.assertEqual(
+            format_cloze_sentence("Drahá kniha leží na stole.", "drahá kniha"),
+            "{{c1::Drahá kniha}} leží na stole.",
+        )
+
+    def test_strip_cloze_and_html(self):
+        self.assertEqual(
+            strip_cloze_and_html("To je {{c1::drahá kniha::noun}}."),
+            "To je drahá kniha.",
+        )
+        self.assertEqual(
+            strip_cloze_and_html("To je <b>drahá kniha</b>."),
+            "To je drahá kniha.",
+        )
 
 
 if __name__ == "__main__":

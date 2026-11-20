@@ -1,6 +1,11 @@
 from __future__ import annotations
 
+import asyncio
+import base64
+from concurrent.futures import ThreadPoolExecutor
 import datetime
+import hashlib
+import logging
 import os
 from pathlib import Path
 import re
@@ -10,23 +15,27 @@ from aiogram import Bot, Dispatcher, Router
 from aiogram.filters import Command
 from aiogram.types import FSInputFile, Message
 from dotenv import load_dotenv
+import edge_tts
 import genanki
 import requests
 
-from src.card_generator import generate_cards
-from src.chunk_tracker import register_harvested_phrases
+from src.card_generator import format_cloze_sentence, generate_cards, strip_cloze_and_html
+from src.chunk_tracker import find_chunk_by_phrase, load_chunk_memory, register_harvested_phrases
 from src.doc_parser import extract_harvest_phrases, generate_clear_highlight_requests
 
 load_dotenv()
+
+logger = logging.getLogger(__name__)
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 DATA_DIR = BASE_DIR / "data"
 
 ANKI_CONNECT_URL = os.getenv("ANKI_CONNECT_URL", "http://localhost:8765")
-DEFAULT_DECK_NAME = "Czech Harvesting"
+DEFAULT_DECK_NAME = "Čeština::Harvester"
+DEFAULT_CLOZE_MODEL = "Cloze"
+EDGE_TTS_VOICE_CS = os.getenv("EDGE_VOICE_CS", "cs-CZ-VlastaNeural")
 
-# Stable unique IDs for genanki deck & model
-GENANKI_MODEL_ID = 1607392319
+# Stable unique ID for genanki deck
 GENANKI_DECK_ID = 2059394012
 
 router = Router(name="harvest_router")
@@ -153,32 +162,103 @@ def clear_document_highlights(
     return True
 
 
-def _build_genanki_model() -> genanki.Model:
-    return genanki.Model(
-        GENANKI_MODEL_ID,
-        "Czech Harvesting Mining Model",
-        fields=[
-            {"name": "Front"},
-            {"name": "Back"},
-            {"name": "Grammar"},
-        ],
-        templates=[
-            {
-                "name": "Czech Sentence Mining Card",
-                "qfmt": "{{Front}}",
-                "afmt": (
-                    "{{FrontSide}}<hr id=\"answer\">"
-                    "<div style=\"font-size: 1.2em; font-weight: bold;\">{{Back}}</div><br>"
-                    "<div style=\"color: #666; font-size: 0.9em; font-style: italic;\">{{Grammar}}</div>"
-                ),
-            }
-        ],
-        css=(
-            ".card { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; "
-            "font-size: 20px; text-align: center; color: #222; background-color: #fff; padding: 20px; }\n"
-            "b { color: #d9534f; font-weight: bold; }\n"
-        ),
+def _ankiconnect_request(
+    action: str,
+    params: Optional[Dict[str, Any]] = None,
+    anki_connect_url: str = ANKI_CONNECT_URL,
+    timeout: float = 5.0,
+) -> Any:
+    """Executes an AnkiConnect v6 JSON-RPC request and validates its error field."""
+    resp = requests.post(
+        anki_connect_url,
+        json={"action": action, "version": 6, "params": params or {}},
+        timeout=timeout,
     )
+    resp.raise_for_status()
+    data = resp.json()
+    if data.get("error") is not None:
+        raise RuntimeError(f"AnkiConnect {action} error: {data.get('error')}")
+    return data.get("result")
+
+
+async def _synthesize_edge_tts_async(text: str, voice: str) -> bytes:
+    """Streams MP3 audio bytes from edge-tts for the given Czech sentence."""
+    communicate = edge_tts.Communicate(text, voice=voice)
+    chunks: List[bytes] = []
+    async for chunk in communicate.stream():
+        if chunk.get("type") == "audio" and chunk.get("data"):
+            chunks.append(chunk["data"])
+    return b"".join(chunks)
+
+
+def synthesize_czech_audio(text: str, voice: str = EDGE_TTS_VOICE_CS) -> bytes:
+    """Synthesizes Czech sentence MP3 audio using edge-tts, safe inside or outside an event loop."""
+    if not text.strip():
+        return b""
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(_synthesize_edge_tts_async(text, voice))
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        return pool.submit(asyncio.run, _synthesize_edge_tts_async(text, voice)).result()
+
+
+def _store_anki_media(
+    clean_sentence: str,
+    anki_connect_url: str = ANKI_CONNECT_URL,
+) -> Optional[str]:
+    """Synthesizes sentence audio via edge-tts and uploads it to Anki via storeMediaFile."""
+    if not clean_sentence:
+        return None
+    digest = hashlib.sha256(clean_sentence.encode("utf-8")).hexdigest()[:12]
+    filename = f"czech_{digest}.mp3"
+    try:
+        audio_bytes = synthesize_czech_audio(clean_sentence)
+        if not audio_bytes:
+            return None
+        b64_data = base64.b64encode(audio_bytes).decode("ascii")
+        _ankiconnect_request(
+            "storeMediaFile",
+            {"filename": filename, "data": b64_data},
+            anki_connect_url=anki_connect_url,
+            timeout=10.0,
+        )
+        return filename
+    except Exception as exc:
+        logger.warning("Failed to synthesize/store audio for %r: %s", clean_sentence, exc)
+        return None
+
+
+def _is_duplicate_in_anki(
+    clean_sentence: str,
+    deck_name: str,
+    anki_connect_url: str = ANKI_CONNECT_URL,
+) -> bool:
+    """Checks Anki via findNotes using the clean sentence text without {{c1::}} syntax."""
+    if not clean_sentence:
+        return False
+    escaped_deck = deck_name.replace('"', '\\"')
+    escaped_sentence = clean_sentence.replace('"', '\\"')
+    query = f'deck:"{escaped_deck}" "{escaped_sentence}"'
+    result = _ankiconnect_request(
+        "findNotes",
+        {"query": query},
+        anki_connect_url=anki_connect_url,
+        timeout=3.0,
+    )
+    return bool(result)
+
+
+def _format_back_extra(translation: str, grammar: str, sound_filename: Optional[str]) -> str:
+    """Formats the Cloze Back Extra field cleanly without <br> concatenation."""
+    parts: List[str] = []
+    if translation:
+        parts.append(f"<div>{translation}</div>")
+    if grammar:
+        parts.append(f"<div><i>{grammar}</i></div>")
+    if sound_filename:
+        parts.append(f"<div>[sound:{sound_filename}]</div>")
+    return "".join(parts)
 
 
 def export_via_genanki(
@@ -186,21 +266,23 @@ def export_via_genanki(
     deck_name: str = DEFAULT_DECK_NAME,
     output_dir: Optional[Path] = None,
 ) -> Path:
-    """Generates an Anki package (.apkg) file using genanki."""
+    """Generates an Anki package (.apkg) file using genanki's standard Cloze model."""
     target_dir = Path(output_dir) if output_dir is not None else DATA_DIR
     target_dir.mkdir(parents=True, exist_ok=True)
 
     deck = genanki.Deck(GENANKI_DECK_ID, deck_name)
-    model = _build_genanki_model()
+    model = genanki.CLOZE_MODEL
 
     for card in cards:
+        cloze_text = format_cloze_sentence(card.get("f", ""))
+        back_extra = _format_back_extra(
+            card.get("t", "").strip(),
+            card.get("g", "").strip(),
+            None,
+        )
         note = genanki.Note(
             model=model,
-            fields=[
-                card.get("f", ""),
-                card.get("t", ""),
-                card.get("g", ""),
-            ],
+            fields=[cloze_text, back_extra],
             tags=["czech_harvest"],
         )
         deck.add_note(note)
@@ -220,62 +302,87 @@ def export_to_anki(
     output_dir: Optional[Path] = None,
 ) -> Dict[str, Any]:
     """
-    Exports cards to Anki.
-    First attempts HTTP POST to local AnkiConnect (http://localhost:8765).
-    If AnkiConnect is unreachable or returns an error, falls back to genanki .apkg generator.
+    Exports Cloze cards to Anki via AnkiConnect v6 (createDeck, modelFieldNames,
+    findNotes, storeMediaFile, addNotes), falling back to genanki .apkg if unreachable.
     """
     if not cards:
         return {"method": "none", "count": 0, "apkg_path": None}
 
     # 1. Attempt AnkiConnect direct HTTP sync
     try:
-        # Create deck if not exists
-        deck_resp = requests.post(
-            anki_connect_url,
-            json={"action": "createDeck", "version": 6, "params": {"deck": deck_name}},
+        _ankiconnect_request(
+            "createDeck",
+            {"deck": deck_name},
+            anki_connect_url=anki_connect_url,
             timeout=2.0,
         )
-        deck_resp.raise_for_status()
-        deck_data = deck_resp.json()
-        if deck_data.get("error") is not None:
-            raise RuntimeError(f"AnkiConnect createDeck error: {deck_data.get('error')}")
 
-        notes_payload = []
+        field_names = _ankiconnect_request(
+            "modelFieldNames",
+            {"modelName": DEFAULT_CLOZE_MODEL},
+            anki_connect_url=anki_connect_url,
+            timeout=2.0,
+        )
+        if not isinstance(field_names, list) or len(field_names) < 2:
+            raise RuntimeError(f"Unexpected Cloze model fields: {field_names!r}")
+        first_field, second_field = field_names[0], field_names[1]
+
+        notes_payload: List[Dict[str, Any]] = []
+        skipped_duplicates = 0
         for card in cards:
+            cloze_sentence = format_cloze_sentence(card.get("f", ""))
+            clean_sentence = strip_cloze_and_html(cloze_sentence)
+
+            if _is_duplicate_in_anki(clean_sentence, deck_name, anki_connect_url=anki_connect_url):
+                skipped_duplicates += 1
+                continue
+
+            sound_filename = _store_anki_media(clean_sentence, anki_connect_url=anki_connect_url)
+            back_extra = _format_back_extra(
+                card.get("t", "").strip(),
+                card.get("g", "").strip(),
+                sound_filename,
+            )
             notes_payload.append({
                 "deckName": deck_name,
-                "modelName": "Basic",
+                "modelName": DEFAULT_CLOZE_MODEL,
                 "fields": {
-                    "Front": card.get("f", ""),
-                    "Back": f"{card.get('t', '')}<br><br><small><i>{card.get('g', '')}</i></small>",
+                    first_field: cloze_sentence,
+                    second_field: back_extra,
                 },
                 "tags": ["czech_harvest"],
             })
 
-        resp = requests.post(
-            anki_connect_url,
-            json={"action": "addNotes", "version": 6, "params": {"notes": notes_payload}},
+        if not notes_payload:
+            return {
+                "method": "ankiconnect",
+                "count": 0,
+                "skipped_duplicates": skipped_duplicates,
+                "apkg_path": None,
+            }
+
+        results = _ankiconnect_request(
+            "addNotes",
+            {"notes": notes_payload},
+            anki_connect_url=anki_connect_url,
             timeout=5.0,
         )
-        resp.raise_for_status()
-        data = resp.json()
-
-        if data.get("error") is None:
-            results = data.get("result")
-            if isinstance(results, list):
-                added_count = sum(1 for item in results if item is not None)
-                if added_count > 0:
-                    return {
-                        "method": "ankiconnect",
-                        "count": added_count,
-                        "apkg_path": None,
-                    }
-            else:
+        if isinstance(results, list):
+            added_count = sum(1 for item in results if item is not None)
+            if added_count > 0:
                 return {
                     "method": "ankiconnect",
-                    "count": len(cards),
+                    "count": added_count,
+                    "skipped_duplicates": skipped_duplicates,
                     "apkg_path": None,
                 }
+        else:
+            return {
+                "method": "ankiconnect",
+                "count": len(notes_payload),
+                "skipped_duplicates": skipped_duplicates,
+                "apkg_path": None,
+            }
     except Exception:
         # AnkiConnect failed or desktop unreachable -> fallback to genanki
         pass
@@ -323,14 +430,29 @@ def run_harvest_pipeline(
     # 3. Generate clear highlight requests
     clear_requests = generate_clear_highlight_requests(phrases)
 
-    # 4. Generate cards via Gemini (or Ollama)
-    cards = generate_cards(phrases, use_local_ollama=use_local_ollama)
+    # 4. Filter out phrases already tracked in data/chunk_memory.json (and batch duplicates)
+    memory = load_chunk_memory(memory_path)
+    seen_norm: set[str] = set()
+    new_phrases: List[Dict[str, Any]] = []
+    for p in phrases:
+        phrase_text = (p.get("phrase") or "").strip()
+        if not phrase_text:
+            continue
+        norm = " ".join(phrase_text.lower().split())
+        if norm in seen_norm or find_chunk_by_phrase(memory, phrase_text) is not None:
+            continue
+        seen_norm.add(norm)
+        new_phrases.append(p)
 
-    # 5. Register in chunk tracker
-    phrase_texts = [p["phrase"] for p in phrases if p.get("phrase")]
-    register_harvested_phrases(phrase_texts, source=doc_id, memory_path=memory_path)
+    # 5. Generate cards via Gemini (or Ollama) only for non-duplicate phrases
+    cards = generate_cards(new_phrases, use_local_ollama=use_local_ollama) if new_phrases else []
 
-    # 6. Export to Anki
+    # 6. Register in chunk tracker
+    phrase_texts = [p["phrase"] for p in new_phrases if p.get("phrase")]
+    if phrase_texts:
+        register_harvested_phrases(phrase_texts, source=doc_id, memory_path=memory_path)
+
+    # 7. Export to Anki
     export_result = export_to_anki(cards, output_dir=output_dir)
 
     # 7. Clear yellow highlights in Google Docs if live token is available

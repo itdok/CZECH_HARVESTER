@@ -86,24 +86,116 @@ class TestExportToAnki(unittest.TestCase):
     def tearDown(self):
         self.temp_dir.cleanup()
 
+    @staticmethod
+    def _mock_rpc_resp(result):
+        resp = mock.MagicMock(status_code=200)
+        resp.json.return_value = {"result": result, "error": None}
+        return resp
+
+    def test_default_deck_name(self):
+        self.assertEqual(DEFAULT_DECK_NAME, "Čeština::Harvester")
+
     def test_empty_cards_export(self):
         res = export_to_anki([], output_dir=self.output_dir)
         self.assertEqual(res["method"], "none")
         self.assertEqual(res["count"], 0)
         self.assertIsNone(res["apkg_path"])
 
-    def test_ankiconnect_success(self):
-        mock_resp = mock.MagicMock()
-        mock_resp.status_code = 200
-        mock_resp.json.return_value = {"result": [101, 102], "error": None}
+    def test_ankiconnect_cloze_english_fields_with_audio(self):
+        responses = [
+            self._mock_rpc_resp(12345),  # createDeck
+            self._mock_rpc_resp(["Text", "Back Extra"]),  # modelFieldNames
+            self._mock_rpc_resp([]),  # findNotes card 1
+            self._mock_rpc_resp("czech_1.mp3"),  # storeMediaFile card 1
+            self._mock_rpc_resp([]),  # findNotes card 2
+            self._mock_rpc_resp("czech_2.mp3"),  # storeMediaFile card 2
+            self._mock_rpc_resp([101, 102]),  # addNotes
+        ]
 
-        with mock.patch("src.harvest_worker.requests.post", return_value=mock_resp) as mock_post:
+        with mock.patch("src.harvest_worker.synthesize_czech_audio", return_value=b"MP3BYTES") as mock_tts, \
+             mock.patch("src.harvest_worker.requests.post", side_effect=responses) as mock_post:
             res = export_to_anki(self.sample_cards, output_dir=self.output_dir)
 
             self.assertEqual(res["method"], "ankiconnect")
             self.assertEqual(res["count"], 2)
             self.assertIsNone(res["apkg_path"])
-            self.assertEqual(mock_post.call_count, 2)  # 1 for createDeck, 1 for addNotes
+            self.assertEqual(mock_tts.call_count, 2)
+            # Clean sentence without {{c1::}} passed to TTS
+            self.assertEqual(mock_tts.call_args_list[0].args[0], "To je drahá kniha.")
+
+            # Verify addNotes payload
+            add_notes_payload = mock_post.call_args_list[-1].kwargs["json"]
+            self.assertEqual(add_notes_payload["action"], "addNotes")
+            note0 = add_notes_payload["params"]["notes"][0]
+            self.assertEqual(note0["deckName"], "Čeština::Harvester")
+            self.assertEqual(note0["modelName"], "Cloze")
+            self.assertEqual(note0["fields"]["Text"], "To je {{c1::drahá kniha}}.")
+            self.assertIn("Это дорогая книга.", note0["fields"]["Back Extra"])
+            self.assertIn("[sound:czech_", note0["fields"]["Back Extra"])
+            self.assertNotIn("<br>", note0["fields"]["Back Extra"])
+
+            # Verify findNotes used clean sentence without {{c1::}}
+            find_payload = mock_post.call_args_list[2].kwargs["json"]
+            self.assertEqual(find_payload["action"], "findNotes")
+            self.assertIn("To je drahá kniha.", find_payload["params"]["query"])
+            self.assertNotIn("{{c1::", find_payload["params"]["query"])
+
+    def test_ankiconnect_cloze_russian_localized_fields(self):
+        responses = [
+            self._mock_rpc_resp(12345),  # createDeck
+            self._mock_rpc_resp(["Текст", "Дополнительно"]),  # Russian Cloze fields
+            self._mock_rpc_resp([]),  # findNotes
+            self._mock_rpc_resp("czech_1.mp3"),  # storeMediaFile
+            self._mock_rpc_resp([101]),  # addNotes
+        ]
+
+        with mock.patch("src.harvest_worker.synthesize_czech_audio", return_value=b"MP3"), \
+             mock.patch("src.harvest_worker.requests.post", side_effect=responses) as mock_post:
+            res = export_to_anki([self.sample_cards[0]], output_dir=self.output_dir)
+
+            self.assertEqual(res["method"], "ankiconnect")
+            self.assertEqual(res["count"], 1)
+            note0 = mock_post.call_args_list[-1].kwargs["json"]["params"]["notes"][0]
+            self.assertIn("Текст", note0["fields"])
+            self.assertIn("Дополнительно", note0["fields"])
+            self.assertEqual(note0["fields"]["Текст"], "To je {{c1::drahá kniha}}.")
+
+    def test_ankiconnect_skips_duplicate_via_find_notes(self):
+        responses = [
+            self._mock_rpc_resp(12345),  # createDeck
+            self._mock_rpc_resp(["Text", "Back Extra"]),  # modelFieldNames
+            self._mock_rpc_resp([999]),  # findNotes -> duplicate for card 1!
+            self._mock_rpc_resp([]),  # findNotes -> new for card 2
+            self._mock_rpc_resp("czech_2.mp3"),  # storeMediaFile card 2
+            self._mock_rpc_resp([202]),  # addNotes
+        ]
+
+        with mock.patch("src.harvest_worker.synthesize_czech_audio", return_value=b"MP3"), \
+             mock.patch("src.harvest_worker.requests.post", side_effect=responses) as mock_post:
+            res = export_to_anki(self.sample_cards, output_dir=self.output_dir)
+
+            self.assertEqual(res["method"], "ankiconnect")
+            self.assertEqual(res["count"], 1)
+            self.assertEqual(res["skipped_duplicates"], 1)
+            notes = mock_post.call_args_list[-1].kwargs["json"]["params"]["notes"]
+            self.assertEqual(len(notes), 1)
+            self.assertEqual(notes[0]["fields"]["Text"], "Mám se {{c1::dobře}}.")
+
+    def test_ankiconnect_all_duplicates_skips_add_notes_and_genanki(self):
+        responses = [
+            self._mock_rpc_resp(12345),  # createDeck
+            self._mock_rpc_resp(["Text", "Back Extra"]),  # modelFieldNames
+            self._mock_rpc_resp([999]),  # findNotes card 1 -> duplicate
+            self._mock_rpc_resp([888]),  # findNotes card 2 -> duplicate
+        ]
+
+        with mock.patch("src.harvest_worker.requests.post", side_effect=responses):
+            res = export_to_anki(self.sample_cards, output_dir=self.output_dir)
+
+            self.assertEqual(res["method"], "ankiconnect")
+            self.assertEqual(res["count"], 0)
+            self.assertEqual(res["skipped_duplicates"], 2)
+            self.assertIsNone(res["apkg_path"])
 
     def test_ankiconnect_connection_error_falls_back_to_genanki(self):
         with mock.patch("src.harvest_worker.requests.post", side_effect=requests.ConnectionError("AnkiConnect unreachable")):
@@ -132,12 +224,18 @@ class TestExportToAnki(unittest.TestCase):
             self.assertTrue(res["apkg_path"].exists())
 
     def test_ankiconnect_all_null_results_falls_back_to_genanki(self):
-        deck_resp = mock.MagicMock(status_code=200)
-        deck_resp.json.return_value = {"result": 123, "error": None}
-        notes_resp = mock.MagicMock(status_code=200)
-        notes_resp.json.return_value = {"result": [None, None], "error": None}
+        responses = [
+            self._mock_rpc_resp(123),  # createDeck
+            self._mock_rpc_resp(["Text", "Back Extra"]),  # modelFieldNames
+            self._mock_rpc_resp([]),  # findNotes 1
+            self._mock_rpc_resp("a.mp3"),  # storeMediaFile 1
+            self._mock_rpc_resp([]),  # findNotes 2
+            self._mock_rpc_resp("b.mp3"),  # storeMediaFile 2
+            self._mock_rpc_resp([None, None]),  # addNotes -> all null
+        ]
 
-        with mock.patch("src.harvest_worker.requests.post", side_effect=[deck_resp, notes_resp]):
+        with mock.patch("src.harvest_worker.synthesize_czech_audio", return_value=b"MP3"), \
+             mock.patch("src.harvest_worker.requests.post", side_effect=responses):
             res = export_to_anki(self.sample_cards, output_dir=self.output_dir)
 
             self.assertEqual(res["method"], "genanki")
@@ -145,12 +243,18 @@ class TestExportToAnki(unittest.TestCase):
             self.assertTrue(res["apkg_path"].exists())
 
     def test_ankiconnect_partial_null_counts_only_added_notes(self):
-        deck_resp = mock.MagicMock(status_code=200)
-        deck_resp.json.return_value = {"result": 123, "error": None}
-        notes_resp = mock.MagicMock(status_code=200)
-        notes_resp.json.return_value = {"result": [101, None], "error": None}
+        responses = [
+            self._mock_rpc_resp(123),  # createDeck
+            self._mock_rpc_resp(["Text", "Back Extra"]),  # modelFieldNames
+            self._mock_rpc_resp([]),  # findNotes 1
+            self._mock_rpc_resp("a.mp3"),  # storeMediaFile 1
+            self._mock_rpc_resp([]),  # findNotes 2
+            self._mock_rpc_resp("b.mp3"),  # storeMediaFile 2
+            self._mock_rpc_resp([101, None]),  # addNotes -> partial null
+        ]
 
-        with mock.patch("src.harvest_worker.requests.post", side_effect=[deck_resp, notes_resp]):
+        with mock.patch("src.harvest_worker.synthesize_czech_audio", return_value=b"MP3"), \
+             mock.patch("src.harvest_worker.requests.post", side_effect=responses):
             res = export_to_anki(self.sample_cards, output_dir=self.output_dir)
 
             self.assertEqual(res["method"], "ankiconnect")
@@ -205,6 +309,24 @@ class TestHarvestPipeline(unittest.TestCase):
             first_chunk = list(loaded_memory.values())[0]
             self.assertEqual(first_chunk["phrase"], "krásný den")
             self.assertEqual(first_chunk["source_lesson"], "doc_test_100")
+
+    def test_pipeline_skips_duplicates_in_chunk_memory(self):
+        from src.chunk_tracker import register_harvested_phrases
+
+        register_harvested_phrases(["krásný den"], source="old_doc", memory_path=self.memory_path)
+
+        with mock.patch("src.harvest_worker.generate_cards") as mock_gen_cards, \
+             mock.patch("src.harvest_worker.export_to_anki", return_value={"method": "none", "count": 0, "apkg_path": None}):
+            pipeline_res = run_harvest_pipeline(
+                doc_id="doc_dup_test",
+                output_dir=self.output_dir,
+                memory_path=self.memory_path,
+            )
+
+            self.assertEqual(pipeline_res["status"], "success")
+            self.assertEqual(pipeline_res["phrases_count"], 1)
+            self.assertEqual(pipeline_res["cards_count"], 0)
+            mock_gen_cards.assert_not_called()
 
     def test_pipeline_with_empty_document(self):
         empty_ast = {"documentId": "empty_doc", "body": {"content": []}}
